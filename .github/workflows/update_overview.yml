@@ -12,15 +12,17 @@ permissions:
 jobs:
   update:
     runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
@@ -41,6 +43,17 @@ jobs:
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add output/jleague_overview.json output/jleague_overview_errors.log
+          git add -A output/jleague_overview.json
+          git add -A output/jleague_overview_errors.log || true
           git commit -m "chore: auto-update jleague overview"
           git push
+
+      - name: Show error log on failure
+        if: failure()
+        run: |
+          if [ -f output/jleague_overview_errors.log ]; then
+            echo "===== output/jleague_overview_errors.log ====="
+            cat output/jleague_overview_errors.log
+          else
+            echo "No output/jleague_overview_errors.log found"
+          fi
