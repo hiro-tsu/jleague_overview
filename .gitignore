@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+*:Zone.Identifier
+output/jleague_overview_errors.log
