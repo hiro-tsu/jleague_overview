@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
+import time
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -37,6 +39,7 @@ PROMPT = """
 """.strip()
 MAX_DUP_RETRIES = 2
 SIMILARITY_THRESHOLD = 0.72
+MAX_PARSE_RETRIES = 4
 
 
 def _now_iso() -> str:
@@ -78,6 +81,33 @@ def _parse_summary(text: str) -> str:
     if not isinstance(summary, str) or not summary.strip():
         raise ValueError("empty summary")
     return summary.strip()
+
+
+def _extract_summary_fallback(text: str) -> str | None:
+    # Recover from partially broken JSON like: {"summary":"... (unterminated)
+    m = re.search(r'"summary"\s*:\s*"', text)
+    if not m:
+        return None
+    start = m.end()
+    buf: list[str] = []
+    escaped = False
+    for ch in text[start:]:
+        if escaped:
+            if ch in {'"', "\\", "/", "b", "f", "n", "r", "t"}:
+                escapes = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+                buf.append(escapes.get(ch, ch))
+            else:
+                buf.append(ch)
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == '"':
+            break
+        buf.append(ch)
+    recovered = "".join(buf).strip()
+    return recovered or None
 
 
 def _is_complete_sentence(summary: str) -> bool:
@@ -196,9 +226,10 @@ def _call_gemini(api_key: str, recent_summaries: List[str]) -> str:
     endpoint = _build_endpoint(selected_model, API_VERSION)
     recent = list(recent_summaries)
     last_error: Exception | None = None
-    for _ in range(MAX_DUP_RETRIES + 1):
+    for attempt in range(MAX_PARSE_RETRIES):
         prompt_text = _build_prompt_with_recent(recent[-5:])
-        payload = build_payload(use_tools=True, use_schema=False, prompt_text=prompt_text)
+        use_tools = attempt < 2
+        payload = build_payload(use_tools=use_tools, use_schema=True, prompt_text=prompt_text)
         resp = post_with_timeout(endpoint, payload)
         if resp.status_code == 404:
             models = _list_models(api_key)
@@ -218,7 +249,13 @@ def _call_gemini(api_key: str, recent_summaries: List[str]) -> str:
 
         data = resp.json()
         try:
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
+            parts = data["candidates"][0]["content"]["parts"]
+            text = next(
+                (p["text"] for p in parts if isinstance(p, dict) and p.get("text", "").strip()),
+                None,
+            )
+            if text is None:
+                raise ValueError("no non-empty text part in Gemini response")
         except (KeyError, IndexError, TypeError) as exc:
             raise ValueError(f"unexpected Gemini response format: {exc}")
         if os.environ.get("GEMINI_DEBUG") == "1":
@@ -227,8 +264,17 @@ def _call_gemini(api_key: str, recent_summaries: List[str]) -> str:
             summary = _parse_summary(text)
         except (json.JSONDecodeError, ValueError) as exc:
             last_error = exc
+            recovered = _extract_summary_fallback(text)
+            if recovered and _is_complete_sentence(recovered) and not _is_similar_topic(recovered, recent_summaries):
+                _log_error("warning: recovered summary from malformed JSON", text[:1000])
+                return recovered
+            _log_error(
+                "warning: failed to parse Gemini JSON summary",
+                f"attempt={attempt + 1}/{MAX_PARSE_RETRIES} model={selected_model}\n{text[:1000]}",
+            )
             if os.environ.get("GEMINI_DEBUG") == "1":
                 print("debug: invalid/empty JSON response:", repr(text), file=sys.stderr)
+            time.sleep(min(2**attempt, 8))
             continue
         if not _is_complete_sentence(summary):
             recent.append(summary)
