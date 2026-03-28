@@ -31,12 +31,13 @@ API_BASE = "https://generativelanguage.googleapis.com"
 LOG_PATH = Path("output/jleague_overview_errors.log")
 TZ = ZoneInfo("Asia/Tokyo")
 
-PROMPT = """
-今日のJリーグファンのSNSやニュースで盛り上がっている話題を検索し1つだけピックアップして、自然な文章にまとめて作成してください。
+def _build_base_prompt(now: datetime) -> str:
+    date_str = now.strftime("%Y年%m月%d日")
+    return f"""\
+{date_str}のJリーグファンのSNSやニュースで盛り上がっている話題を検索し1つだけピックアップして、自然な文章にまとめて作成してください。
 必ず完結した文章にしてください。「今日のJリーグのニュースでは」などのような前置きは絶対NG。
 
-出力は次のJSON形式のみ: {"summary":"ここに文章"}
-""".strip()
+出力は次のJSON形式のみ: {{"summary":"ここに文章"}}"""
 MAX_DUP_RETRIES = 2
 SIMILARITY_THRESHOLD = 0.72
 MAX_PARSE_RETRIES = 4
@@ -161,12 +162,13 @@ def _pick_model(models: List[dict[str, Any]]) -> str | None:
     return model_id(eligible[0])
 
 
-def _build_prompt_with_recent(recent_summaries: List[str]) -> str:
+def _build_prompt_with_recent(recent_summaries: List[str], now: datetime) -> str:
+    base = _build_base_prompt(now)
     if not recent_summaries:
-        return PROMPT
+        return base
     lines = [f"- {s}" for s in recent_summaries]
     return (
-        f"{PROMPT}\n\n"
+        f"{base}\n\n"
         "直近に採用済みの概況（同じネタは避けること）:\n"
         + "\n".join(lines)
         + "\n\n同じ話題を繰り返さず、別の盛り上がりを1つ選んでください。"
@@ -191,7 +193,7 @@ def _is_similar_topic(summary: str, candidates: List[str]) -> bool:
     return False
 
 
-def _call_gemini(api_key: str, recent_summaries: List[str]) -> str:
+def _call_gemini(api_key: str, recent_summaries: List[str], now: datetime) -> str:
     def build_payload(use_tools: bool, use_schema: bool, prompt_text: str) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "contents": [
@@ -227,9 +229,9 @@ def _call_gemini(api_key: str, recent_summaries: List[str]) -> str:
     recent = list(recent_summaries)
     last_error: Exception | None = None
     for attempt in range(MAX_PARSE_RETRIES):
-        prompt_text = _build_prompt_with_recent(recent[-5:])
+        prompt_text = _build_prompt_with_recent(recent[-20:], now)
         use_tools = attempt < 2
-        payload = build_payload(use_tools=use_tools, use_schema=True, prompt_text=prompt_text)
+        payload = build_payload(use_tools=use_tools, use_schema=not use_tools, prompt_text=prompt_text)
         resp = post_with_timeout(endpoint, payload)
         if resp.status_code == 404:
             models = _list_models(api_key)
@@ -328,13 +330,13 @@ def main() -> int:
 
     now = datetime.now(TZ)
     now_iso = now.isoformat(timespec="seconds")
-    cutoff = now - timedelta(hours=24)
+    cutoff = now - timedelta(hours=72)
     history = _prune_history(history, cutoff)
-    recent_summaries = [h.get("summary_text", "") for h in history[-5:] if isinstance(h.get("summary_text"), str)]
+    recent_summaries = [h.get("summary_text", "") for h in history[-20:] if isinstance(h.get("summary_text"), str)]
     if isinstance(prev_current, dict) and isinstance(prev_current.get("summary_text"), str):
         recent_summaries.append(prev_current["summary_text"])
 
-    summary = _call_gemini(api_key, recent_summaries)
+    summary = _call_gemini(api_key, recent_summaries, now)
 
     output = {
         "updated_at": now_iso,
