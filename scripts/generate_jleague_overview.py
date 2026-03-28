@@ -194,8 +194,8 @@ def _is_similar_topic(summary: str, candidates: List[str]) -> bool:
 
 
 def _call_gemini(api_key: str, recent_summaries: List[str], now: datetime) -> str:
-    def build_payload(use_tools: bool, use_schema: bool, prompt_text: str) -> dict[str, Any]:
-        payload: dict[str, Any] = {
+    def build_payload(prompt_text: str) -> dict[str, Any]:
+        return {
             "contents": [
                 {
                     "role": "user",
@@ -205,18 +205,14 @@ def _call_gemini(api_key: str, recent_summaries: List[str], now: datetime) -> st
             "generationConfig": {
                 "temperature": 0.7,
                 "maxOutputTokens": 1024,
+                "responseMimeType": "application/json",
+                "responseSchema": {
+                    "type": "object",
+                    "properties": {"summary": {"type": "string"}},
+                    "required": ["summary"],
+                },
             },
         }
-        if use_tools:
-            payload["tools"] = [{"google_search": {}}]
-        if use_schema:
-            payload["generationConfig"]["responseMimeType"] = "application/json"
-            payload["generationConfig"]["responseSchema"] = {
-                "type": "object",
-                "properties": {"summary": {"type": "string"}},
-                "required": ["summary"],
-            }
-        return payload
 
     def post_with_timeout(endpoint: str, payload: dict[str, Any]) -> requests.Response:
         try:
@@ -230,8 +226,7 @@ def _call_gemini(api_key: str, recent_summaries: List[str], now: datetime) -> st
     last_error: Exception | None = None
     for attempt in range(MAX_PARSE_RETRIES):
         prompt_text = _build_prompt_with_recent(recent[-20:], now)
-        use_tools = attempt < 2
-        payload = build_payload(use_tools=use_tools, use_schema=not use_tools, prompt_text=prompt_text)
+        payload = build_payload(prompt_text)
         resp = post_with_timeout(endpoint, payload)
         if resp.status_code == 404:
             models = _list_models(api_key)
