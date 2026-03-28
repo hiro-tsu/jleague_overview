@@ -1,9 +1,9 @@
 name: Update J.League Overview
 
 on:
-  # schedule:
-  #   # Every 4 hours (UTC)
-  #   - cron: '0 */4 * * *'
+  schedule:
+    # Every 4 hours (UTC)
+    - cron: '0 */4 * * *'
   workflow_dispatch:
 
 permissions:

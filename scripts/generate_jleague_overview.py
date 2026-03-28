@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 import time
 from datetime import datetime, timedelta
@@ -31,16 +30,22 @@ API_BASE = "https://generativelanguage.googleapis.com"
 LOG_PATH = Path("output/jleague_overview_errors.log")
 TZ = ZoneInfo("Asia/Tokyo")
 
-def _build_base_prompt(now: datetime) -> str:
-    date_str = now.strftime("%Y年%m月%d日")
-    return f"""\
-{date_str}のJリーグファンのSNSやニュースで盛り上がっている話題を検索し1つだけピックアップして、自然な文章にまとめて作成してください。
-必ず完結した文章にしてください。「今日のJリーグのニュースでは」などのような前置きは絶対NG。
-
-出力は次のJSON形式のみ: {{"summary":"ここに文章"}}"""
-MAX_DUP_RETRIES = 2
 SIMILARITY_THRESHOLD = 0.72
-MAX_PARSE_RETRIES = 4
+MAX_RETRIES = 4
+
+
+def _build_prompt(now: datetime, recent_summaries: List[str]) -> str:
+    date_str = now.strftime("%Y年%m月%d日")
+    lines = [
+        f"あなたが知っている最新のJリーグに関するニュースや話題を1つ選び（{date_str}以前の情報で構わない）、",
+        "1〜2文の自然な日本語にまとめてください。",
+        "「今日のJリーグのニュースでは」などの前置きは不要。",
+        "文末は「。」で終わること。",
+    ]
+    if recent_summaries:
+        lines.append("\n以下の話題はすでに取り上げ済みなので別の話題を選んでください:")
+        lines.extend(f"- {s}" for s in recent_summaries)
+    return "\n".join(lines)
 
 
 def _now_iso() -> str:
@@ -61,58 +66,8 @@ def _load_existing() -> dict[str, Any]:
         return {}
 
 
-def _parse_summary(text: str) -> str:
-    raw = text.strip()
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        # Allow fenced JSON, but do not accept truncated JSON.
-        if raw.startswith("```"):
-            lines = raw.splitlines()
-            if len(lines) >= 3 and lines[0].startswith("```") and lines[-1].startswith("```"):
-                raw = "\n".join(lines[1:-1]).strip()
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            raise
-        data = json.loads(raw[start : end + 1])
-    if not isinstance(data, dict) or "summary" not in data:
-        raise ValueError("missing summary in JSON response")
-    summary = data["summary"]
-    if not isinstance(summary, str) or not summary.strip():
-        raise ValueError("empty summary")
-    return summary.strip()
-
-
-def _extract_summary_fallback(text: str) -> str | None:
-    # Recover from partially broken JSON like: {"summary":"... (unterminated)
-    m = re.search(r'"summary"\s*:\s*"', text)
-    if not m:
-        return None
-    start = m.end()
-    buf: list[str] = []
-    escaped = False
-    for ch in text[start:]:
-        if escaped:
-            if ch in {'"', "\\", "/", "b", "f", "n", "r", "t"}:
-                escapes = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
-                buf.append(escapes.get(ch, ch))
-            else:
-                buf.append(ch)
-            escaped = False
-            continue
-        if ch == "\\":
-            escaped = True
-            continue
-        if ch == '"':
-            break
-        buf.append(ch)
-    recovered = "".join(buf).strip()
-    return recovered or None
-
-
-def _is_complete_sentence(summary: str) -> bool:
-    s = summary.strip()
+def _is_complete_sentence(text: str) -> bool:
+    s = text.strip()
     return bool(s) and s.endswith(("。", "！", "？", "!", "?"))
 
 
@@ -127,52 +82,6 @@ def _log_error(message: str, detail: str) -> None:
         f.write(f"[{ts}] {message}\n")
         if detail:
             f.write(f"{detail}\n")
-
-
-def _list_models(api_key: str) -> List[dict[str, Any]]:
-    url = f"{API_BASE}/{API_VERSION}/models"
-    resp = requests.get(url, params={"key": api_key}, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    models = data.get("models", [])
-    return models if isinstance(models, list) else []
-
-
-def _pick_model(models: List[dict[str, Any]]) -> str | None:
-    def supports_generate_content(m: dict[str, Any]) -> bool:
-        methods = m.get("supportedGenerationMethods", [])
-        return "generateContent" in methods if isinstance(methods, list) else False
-
-    eligible = [m for m in models if supports_generate_content(m)]
-    if not eligible:
-        return None
-
-    def model_id(m: dict[str, Any]) -> str:
-        name = m.get("name", "")
-        return name.replace("models/", "")
-
-    preferred = [m for m in eligible if model_id(m) == MODEL_NAME]
-    if preferred:
-        return model_id(preferred[0])
-    if "gemini-2.5-flash" in [model_id(m) for m in eligible]:
-        return "gemini-2.5-flash"
-    flash = [m for m in eligible if "flash" in model_id(m)]
-    if flash:
-        return model_id(flash[0])
-    return model_id(eligible[0])
-
-
-def _build_prompt_with_recent(recent_summaries: List[str], now: datetime) -> str:
-    base = _build_base_prompt(now)
-    if not recent_summaries:
-        return base
-    lines = [f"- {s}" for s in recent_summaries]
-    return (
-        f"{base}\n\n"
-        "直近に採用済みの概況（同じネタは避けること）:\n"
-        + "\n".join(lines)
-        + "\n\n同じ話題を繰り返さず、別の盛り上がりを1つ選んでください。"
-    )
 
 
 def _normalize_text(text: str) -> str:
@@ -196,21 +105,11 @@ def _is_similar_topic(summary: str, candidates: List[str]) -> bool:
 def _call_gemini(api_key: str, recent_summaries: List[str], now: datetime) -> str:
     def build_payload(prompt_text: str) -> dict[str, Any]:
         return {
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [{"text": prompt_text}],
-                }
-            ],
+            "contents": [{"role": "user", "parts": [{"text": prompt_text}]}],
             "generationConfig": {
                 "temperature": 0.7,
-                "maxOutputTokens": 1024,
-                "responseMimeType": "application/json",
-                "responseSchema": {
-                    "type": "object",
-                    "properties": {"summary": {"type": "string"}},
-                    "required": ["summary"],
-                },
+                "maxOutputTokens": 512,
+                "thinkingConfig": {"thinkingBudget": 0},
             },
         }
 
@@ -220,23 +119,16 @@ def _call_gemini(api_key: str, recent_summaries: List[str], now: datetime) -> st
         except requests.exceptions.ReadTimeout:
             return requests.post(endpoint, params={"key": api_key}, json=payload, timeout=120)
 
-    selected_model = MODEL_NAME
-    endpoint = _build_endpoint(selected_model, API_VERSION)
+    endpoint = _build_endpoint(MODEL_NAME, API_VERSION)
     recent = list(recent_summaries)
-    last_error: Exception | None = None
-    for attempt in range(MAX_PARSE_RETRIES):
-        prompt_text = _build_prompt_with_recent(recent[-20:], now)
+
+    for attempt in range(MAX_RETRIES):
+        prompt_text = _build_prompt(now, recent[-20:])
         payload = build_payload(prompt_text)
         resp = post_with_timeout(endpoint, payload)
-        if resp.status_code == 404:
-            models = _list_models(api_key)
-            picked = _pick_model(models)
-            if picked and picked != selected_model:
-                selected_model = picked
-                endpoint = _build_endpoint(selected_model, API_VERSION)
-                resp = post_with_timeout(endpoint, payload)
+
         if os.environ.get("GEMINI_DEBUG") == "1":
-            print(f"debug: requested_model={MODEL_NAME} selected_model={selected_model}", file=sys.stderr)
+            print(f"debug: model={MODEL_NAME} attempt={attempt + 1}", file=sys.stderr)
 
         if resp.status_code >= 400:
             print(f"error: Gemini API status {resp.status_code}", file=sys.stderr)
@@ -247,41 +139,37 @@ def _call_gemini(api_key: str, recent_summaries: List[str], now: datetime) -> st
         data = resp.json()
         try:
             parts = data["candidates"][0]["content"]["parts"]
+            # Skip thought parts (gemini-2.5-flash thinking model)
             text = next(
-                (p["text"] for p in parts if isinstance(p, dict) and p.get("text", "").strip()),
+                (p["text"] for p in parts if isinstance(p, dict) and not p.get("thought") and p.get("text", "").strip()),
                 None,
             )
-            if text is None:
-                raise ValueError("no non-empty text part in Gemini response")
         except (KeyError, IndexError, TypeError) as exc:
             raise ValueError(f"unexpected Gemini response format: {exc}")
+
         if os.environ.get("GEMINI_DEBUG") == "1":
-            print("debug: raw gemini text:", repr(text), file=sys.stderr)
-        try:
-            summary = _parse_summary(text)
-        except (json.JSONDecodeError, ValueError) as exc:
-            last_error = exc
-            recovered = _extract_summary_fallback(text)
-            if recovered and _is_complete_sentence(recovered) and not _is_similar_topic(recovered, recent_summaries):
-                _log_error("warning: recovered summary from malformed JSON", text[:1000])
-                return recovered
-            _log_error(
-                "warning: failed to parse Gemini JSON summary",
-                f"attempt={attempt + 1}/{MAX_PARSE_RETRIES} model={selected_model}\n{text[:1000]}",
-            )
-            if os.environ.get("GEMINI_DEBUG") == "1":
-                print("debug: invalid/empty JSON response:", repr(text), file=sys.stderr)
-            time.sleep(min(2**attempt, 8))
+            print("debug: raw text:", repr(text), file=sys.stderr)
+
+        if not text or not text.strip():
+            _log_error(f"warning: empty response on attempt {attempt + 1}", "")
+            time.sleep(min(2 ** attempt, 8))
             continue
+
+        summary = text.strip()
+
         if not _is_complete_sentence(summary):
+            _log_error(f"warning: incomplete sentence on attempt {attempt + 1}", summary[:500])
             recent.append(summary)
             continue
-        if not _is_similar_topic(summary, recent_summaries):
-            return summary
-        recent.append(summary)
-    if last_error:
-        raise ValueError(f"failed to parse valid summary after retries: {last_error}")
-    raise ValueError("failed to generate non-duplicate complete summary after retries")
+
+        if _is_similar_topic(summary, recent_summaries):
+            _log_error(f"warning: duplicate topic on attempt {attempt + 1}", summary[:500])
+            recent.append(summary)
+            continue
+
+        return summary
+
+    raise ValueError(f"failed to generate valid summary after {MAX_RETRIES} attempts")
 
 
 def _prune_history(history: List[dict[str, Any]], cutoff: datetime) -> List[dict[str, Any]]:
